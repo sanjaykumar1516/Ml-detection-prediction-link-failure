@@ -1,0 +1,33 @@
+
+# Python virtual environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend dependencies and builds
+node_modules/
+dist/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases and temporary files
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Cesium generated build files
+frontend/public/Cesium/
