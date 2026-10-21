@@ -8,15 +8,18 @@ import React, {
 
 import {
   Viewer,
-  Entity as CesiumEntity
+  Entity as CesiumEntity,
+  useCesium
 } from "resium";
 
 import {
+  Cartesian2,
   Cartesian3,
   Color,
   Ion,
-  OpenStreetMapImageryProvider,
-  UrlTemplateImageryProvider
+  ImageryLayer,
+  Terrain,
+  VerticalOrigin
 } from "cesium";
 
 import Plot from "react-plotly.js";
@@ -35,7 +38,9 @@ import {
   RefreshCw
 } from "lucide-react";
 
-Ion.defaultAccessToken = undefined;
+// Cesium ion token from frontend/.env
+Ion.defaultAccessToken =
+  import.meta.env.VITE_CESIUM_ION_TOKEN || "";
 
 const API = "/api";
 
@@ -79,13 +84,30 @@ const chartLayout = {
   autosize: true
 };
 
+// -------------------------------
+// Backend API helpers
+// -------------------------------
+
 async function request(path, options = {}) {
   const response = await fetch(API + path, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json"
+    },
     ...options
   });
 
-  const data = await response.json();
+  const raw = await response.text();
+
+  let data;
+
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error(
+      `API returned an invalid response (${response.status}). ` +
+      raw.slice(0, 150)
+    );
+  }
 
   if (!response.ok) {
     throw new Error(
@@ -104,6 +126,10 @@ function post(path, data = {}) {
     body: JSON.stringify(data)
   });
 }
+
+// -------------------------------
+// Reusable dashboard components
+// -------------------------------
 
 function Card({ title, children }) {
   return (
@@ -125,7 +151,12 @@ function Metric({ label, value, unit = "" }) {
   );
 }
 
-function Chart({ title, history, field, color = "#38bdf8" }) {
+function Chart({
+  title,
+  history,
+  field,
+  color = "#38bdf8"
+}) {
   return (
     <Card title={title}>
       <Plot
@@ -135,8 +166,13 @@ function Chart({ title, history, field, color = "#38bdf8" }) {
             y: history.map(x => x[field]),
             type: "scatter",
             mode: "lines+markers",
-            line: { color, width: 2 },
-            marker: { size: 4 }
+            line: {
+              color,
+              width: 2
+            },
+            marker: {
+              size: 4
+            }
           }
         ]}
         layout={{
@@ -154,11 +190,79 @@ function Chart({ title, history, field, color = "#38bdf8" }) {
   );
 }
 
-function Globe({ satellites, selected, onSelect, station }) {
+// -------------------------------
+// Realistic Cesium Earth settings
+// -------------------------------
+
+function EarthSettings() {
+  const { viewer } = useCesium();
+
+  useEffect(() => {
+    if (!viewer || viewer.isDestroyed()) return;
+
+    const scene = viewer.scene;
+
+   
+scene.globe.show = true;
+scene.globe.baseColor = Color.DARKBLUE;
+scene.globe.enableLighting = false;
+
+viewer.camera.flyHome(0);
+scene.requestRender();
+
+
+    // Earth atmosphere
+    scene.globe.showGroundAtmosphere = true;
+
+    if (scene.skyAtmosphere) {
+      scene.skyAtmosphere.show = true;
+    }
+
+    // Sun and Moon
+    if (scene.sun) {
+      scene.sun.show = true;
+    }
+
+    if (scene.moon) {
+      scene.moon.show = true;
+    }
+
+    // Start with a full-Earth camera view
+    viewer.camera.setView({
+      destination: Cartesian3.fromDegrees(
+        77.5946,
+        12.9716,
+        20000000
+      )
+    });
+
+    scene.requestRender();
+  }, [viewer]);
+
+  return null;
+}
+
+// -------------------------------
+// 3D Globe
+// -------------------------------
+
+function Globe({
+  satellites,
+  selected,
+  onSelect,
+  station
+}) {
   const imagery = useMemo(
-    () => new OpenStreetMapImageryProvider({
-      url: "https://tile.openstreetmap.org/"
-    }),
+    () => ImageryLayer.fromWorldImagery(),
+    []
+  );
+
+  const terrain = useMemo(
+    () =>
+      Terrain.fromWorldTerrain({
+        requestVertexNormals: true,
+        requestWaterMask: true
+      }),
     []
   );
 
@@ -166,46 +270,84 @@ function Globe({ satellites, selected, onSelect, station }) {
     <div className="globe">
       <Viewer
         full
-        timeline={false}
-        animation={false}
+        baseLayer={imagery}
+        terrain={undefined}
         baseLayerPicker={false}
+        animation={false}
+        timeline={false}
         geocoder={false}
         homeButton={true}
-        sceneModePicker={false}
         navigationHelpButton={false}
-        infoBox={false}
-        selectionIndicator={false}
-        imageryProvider={imagery}
+        sceneModePicker={false}
+        shouldAnimate={true}
+        infoBox={true}
+        selectionIndicator={true}
       >
-        {satellites.map(s => (
-          <CesiumEntity
-            key={s.id}
-            name={s.name}
-            position={Cartesian3.fromDegrees(
-              s.longitude,
-              s.latitude,
-              s.altitude_km * 1000
-            )}
-            point={{
-              pixelSize: selected === s.id ? 13 : 7,
-              color: selected === s.id
-                ? Color.YELLOW
-                : Color.CYAN,
-              outlineColor: Color.WHITE,
-              outlineWidth: 1
-            }}
-            label={{
-              text: selected === s.id ? s.name : "",
-              font: "13px sans-serif",
-              fillColor: Color.WHITE,
-              pixelOffset: { x: 0, y: -22 }
-            }}
-            onClick={() => onSelect(s.id)}
-          />
-        ))}
+        <EarthSettings />
 
+        {/* Satellite positions */}
+        {satellites.map(sat => {
+          const longitude = Number(sat.longitude);
+          const latitude = Number(sat.latitude);
+          const altitude =
+            Number(sat.altitude_km) * 1000;
+
+          if (
+            !Number.isFinite(longitude) ||
+            !Number.isFinite(latitude) ||
+            !Number.isFinite(altitude)
+          ) {
+            return null;
+          }
+
+          const isSelected = sat.id === selected;
+
+          return (
+            <CesiumEntity
+              key={sat.id}
+              name={sat.name}
+              description={
+                `Satellite: ${sat.name}<br/>` +
+                `NORAD ID: ${sat.id}<br/>` +
+                `Altitude: ${sat.altitude_km} km`
+              }
+              position={Cartesian3.fromDegrees(
+                longitude,
+                latitude,
+                altitude
+              )}
+              point={{
+                pixelSize: isSelected ? 13 : 7,
+                color: isSelected
+                  ? Color.YELLOW
+                  : Color.CYAN,
+                outlineColor: Color.BLACK,
+                outlineWidth: 2,
+                disableDepthTestDistance:
+                  Number.POSITIVE_INFINITY
+              }}
+              label={
+                isSelected
+                  ? {
+                      text: sat.name,
+                      font: "14px sans-serif",
+                      fillColor: Color.WHITE,
+                      outlineColor: Color.BLACK,
+                      outlineWidth: 2,
+                      pixelOffset: new Cartesian2(0, -22),
+                      verticalOrigin: VerticalOrigin.BOTTOM
+                    }
+                  : undefined
+              }
+              onClick={() => onSelect(sat.id)}
+            />
+          );
+        })}
+
+        {/* Ground station */}
         <CesiumEntity
           name="Ground Station"
+          description="Demonstration ground station"
           position={Cartesian3.fromDegrees(
             Number(station.longitude),
             Number(station.latitude),
@@ -213,18 +355,32 @@ function Globe({ satellites, selected, onSelect, station }) {
           )}
           point={{
             pixelSize: 12,
-            color: Color.LIME
+            color: Color.LIME,
+            outlineColor: Color.WHITE,
+            outlineWidth: 2,
+            disableDepthTestDistance:
+              Number.POSITIVE_INFINITY
           }}
           label={{
             text: "Ground Station",
-            font: "13px sans-serif",
-            fillColor: Color.LIME
+            font: "14px sans-serif",
+            fillColor: Color.WHITE,
+            outlineColor: Color.BLACK,
+            outlineWidth: 2,
+            pixelOffset: new Cartesian2(0, -20),
+            verticalOrigin: VerticalOrigin.BOTTOM,
+            disableDepthTestDistance:
+              Number.POSITIVE_INFINITY
           }}
         />
       </Viewer>
     </div>
   );
 }
+
+// -------------------------------
+// Main application
+// -------------------------------
 
 export default function App() {
   const [page, setPage] = useState("Overview");
@@ -261,25 +417,37 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const chosen = satellites.find(s => s.id === selected);
+  const chosen = satellites.find(
+    s => s.id === selected
+  );
 
   const filtered = satellites.filter(s =>
-    s.name.toLowerCase().includes(search.toLowerCase()) ||
-    s.id.includes(search)
+    s.name.toLowerCase().includes(
+      search.toLowerCase()
+    ) ||
+    String(s.id).includes(search)
   );
+
+  // -------------------------------
+  // Load orbital data
+  // -------------------------------
 
   const loadSatellites = useCallback(async () => {
     try {
       const result = await request("/satellites");
 
-      setSatellites(result.satellites);
+      setSatellites(result.satellites || []);
       setSource(result);
 
       setSelected(previous => {
         if (
           previous &&
-          result.satellites.some(s => s.id === previous)
-        ) return previous;
+          result.satellites.some(
+            s => s.id === previous
+          )
+        ) {
+          return previous;
+        }
 
         return result.satellites[0]?.id || "";
       });
@@ -297,7 +465,9 @@ export default function App() {
 
   const loadEvents = useCallback(async () => {
     try {
-      setEvents(await request("/events?limit=100"));
+      setEvents(
+        await request("/events?limit=100")
+      );
     } catch (err) {
       setError(err.message);
     }
@@ -307,16 +477,25 @@ export default function App() {
     loadSatellites();
     loadEvents();
 
-    request("/thresholds").then(setThresholds).catch(() => {});
+    request("/thresholds")
+      .then(setThresholds)
+      .catch(() => {});
 
     request("/ml/evaluation")
       .then(setEvaluation)
       .catch(() => {});
 
-    const timer = setInterval(loadSatellites, 60000);
+    const timer = setInterval(
+      loadSatellites,
+      60000
+    );
 
     return () => clearInterval(timer);
   }, [loadSatellites, loadEvents]);
+
+  // -------------------------------
+  // Live simulation monitoring
+  // -------------------------------
 
   useEffect(() => {
     if (!running) return;
@@ -325,13 +504,17 @@ export default function App() {
 
     const timer = setInterval(async () => {
       if (busy) return;
+
       busy = true;
 
       try {
-        const result = await request("/monitoring/metrics");
+        const result = await request(
+          "/monitoring/metrics"
+        );
 
         if (result.latest) {
           setMetrics(result.latest);
+
           setHistory(previous =>
             [...previous, result.latest].slice(-60)
           );
@@ -345,6 +528,10 @@ export default function App() {
 
     return () => clearInterval(timer);
   }, [running]);
+
+  // -------------------------------
+  // Ground station visibility
+  // -------------------------------
 
   async function checkVisibility() {
     if (!selected) return;
@@ -369,6 +556,10 @@ export default function App() {
     }
   }
 
+  // -------------------------------
+  // Simulation controls
+  // -------------------------------
+
   async function startSimulation() {
     try {
       await post("/simulation/start", {
@@ -389,6 +580,7 @@ export default function App() {
   async function stopSimulation() {
     try {
       await post("/simulation/stop");
+
       setRunning(false);
       loadEvents();
     } catch (err) {
@@ -409,6 +601,10 @@ export default function App() {
     }
   }
 
+  // -------------------------------
+  // Threshold settings
+  // -------------------------------
+
   async function saveThresholds() {
     try {
       const result = await post("/thresholds", {
@@ -420,11 +616,16 @@ export default function App() {
 
       setThresholds(result);
       setError("");
+
       alert("Thresholds saved");
     } catch (err) {
       setError(err.message);
     }
   }
+
+  // -------------------------------
+  // Machine learning
+  // -------------------------------
 
   async function runML() {
     if (!metrics) return;
@@ -450,6 +651,10 @@ export default function App() {
     }
   }
 
+  // -------------------------------
+  // Satellite selection panel
+  // -------------------------------
+
   const satellitePanel = (
     <Card title="Satellite Selection">
       <input
@@ -474,31 +679,67 @@ export default function App() {
 
       {chosen && (
         <div className="details">
-          <Metric label="Satellite" value={chosen.name} />
-          <Metric label="NORAD ID" value={chosen.id} />
-          <Metric label="Latitude" value={chosen.latitude} unit="°" />
-          <Metric label="Longitude" value={chosen.longitude} unit="°" />
-          <Metric label="Altitude" value={chosen.altitude_km} unit="km" />
+          <Metric
+            label="Satellite"
+            value={chosen.name}
+          />
+
+          <Metric
+            label="NORAD ID"
+            value={chosen.id}
+          />
+
+          <Metric
+            label="Latitude"
+            value={chosen.latitude}
+            unit="°"
+          />
+
+          <Metric
+            label="Longitude"
+            value={chosen.longitude}
+            unit="°"
+          />
+
+          <Metric
+            label="Altitude"
+            value={chosen.altitude_km}
+            unit="km"
+          />
+
           <Metric
             label="Orbital-data age"
             value={chosen.orbital_age_hours}
             unit="hours"
           />
+
           <Metric
             label="Orbital data"
-            value={chosen.stale ? "STALE" : "Within 7 days"}
+            value={
+              chosen.stale
+                ? "STALE"
+                : "Within 7 days"
+            }
           />
-          <p className="muted">TLE epoch: {chosen.epoch}</p>
+
+          <p className="muted">
+            TLE epoch: {chosen.epoch}
+          </p>
         </div>
       )}
     </Card>
   );
 
+  // -------------------------------
+  // Globe panel
+  // -------------------------------
+
   const globePanel = (
     <Card title="3D Satellite Explorer">
       <p className="muted">
-        Positions calculated from CelesTrak orbital elements.
-        This is not a direct satellite connection.
+        Positions calculated from CelesTrak orbital
+        elements. This is not a direct satellite
+        connection.
       </p>
 
       <Globe
@@ -509,26 +750,33 @@ export default function App() {
       />
 
       <button onClick={loadSatellites}>
-        <RefreshCw size={15} /> Refresh Positions
+        <RefreshCw size={15} />
+        Refresh Positions
       </button>
 
       <p className="muted">
-        Last orbital-data fetch: {source?.last_fetch || "Loading"}
+        Last orbital-data fetch:{" "}
+        {source?.last_fetch || "Loading"}
       </p>
     </Card>
   );
 
+  // -------------------------------
+  // Ground station panel
+  // -------------------------------
+
   const groundPanel = (
     <Card title="Ground Station and Visibility">
       <p className="muted">
-        Default demonstration station: Bengaluru, India.
-        Coordinates are editable.
+        Default demonstration station: Bengaluru,
+        India. Coordinates are editable.
       </p>
 
       <div className="form-grid">
         {Object.keys(station).map(key => (
           <label key={key}>
             {key.replaceAll("_", " ")}
+
             <input
               type="number"
               step="any"
@@ -544,7 +792,10 @@ export default function App() {
         ))}
       </div>
 
-      <button onClick={checkVisibility} disabled={!selected || loading}>
+      <button
+        onClick={checkVisibility}
+        disabled={!selected || loading}
+      >
         Calculate Visibility
       </button>
 
@@ -555,81 +806,136 @@ export default function App() {
             value={visibility.elevation_deg}
             unit="°"
           />
+
           <Metric
             label="Azimuth"
             value={visibility.azimuth_deg}
             unit="°"
           />
+
           <Metric
             label="Range"
             value={visibility.range_km}
             unit="km"
           />
+
           <Metric
             label="Geometric line of sight"
             value={
-              visibility.geometric_line_of_sight ? "YES" : "NO"
+              visibility.geometric_line_of_sight
+                ? "YES"
+                : "NO"
             }
           />
+
           <Metric
             label="Above elevation mask"
             value={
-              visibility.above_elevation_mask ? "YES" : "NO"
+              visibility.above_elevation_mask
+                ? "YES"
+                : "NO"
             }
           />
-          <p className="muted">{visibility.note}</p>
+
+          <p className="muted">
+            {visibility.note}
+          </p>
         </div>
       )}
     </Card>
   );
 
+  // -------------------------------
+  // Monitoring panel
+  // -------------------------------
+
   const monitoringPanel = (
     <>
       <Card title="Communication Link Monitoring">
         <p className="warning">
-          SIMULATION MODE — These are generated values,
-          not actual satellite-radio measurements.
+          SIMULATION MODE — These are generated
+          values, not actual satellite-radio
+          measurements.
         </p>
 
         <div className="metric-grid">
-          <Metric label="Link State" value={metrics?.state} />
-          <Metric label="Latency" value={metrics?.latency} unit="ms" />
-          <Metric label="Packet Loss" value={metrics?.packet_loss} unit="%" />
-          <Metric label="Jitter" value={metrics?.jitter} unit="ms" />
-          <Metric label="Simulated SNR" value={metrics?.snr} unit="dB" />
+          <Metric
+            label="Link State"
+            value={metrics?.state}
+          />
+
+          <Metric
+            label="Latency"
+            value={metrics?.latency}
+            unit="ms"
+          />
+
+          <Metric
+            label="Packet Loss"
+            value={metrics?.packet_loss}
+            unit="%"
+          />
+
+          <Metric
+            label="Jitter"
+            value={metrics?.jitter}
+            unit="ms"
+          />
+
+          <Metric
+            label="Simulated SNR"
+            value={metrics?.snr}
+            unit="dB"
+          />
+
           <Metric
             label="Simulated Throughput"
             value={metrics?.throughput}
             unit="Mbps"
           />
-          <Metric label="Quality Score" value={metrics?.quality} />
+
+          <Metric
+            label="Quality Score"
+            value={metrics?.quality}
+          />
         </div>
 
         <h4>Threshold Alerts</h4>
 
         {metrics?.violations?.length ? (
           metrics.violations.map((v, i) => (
-            <p className="alert" key={i}>{v}</p>
+            <p className="alert" key={i}>
+              {v}
+            </p>
           ))
         ) : (
-          <p className="muted">No current threshold violations.</p>
+          <p className="muted">
+            No current threshold violations.
+          </p>
         )}
       </Card>
 
       <div className="chart-grid">
-        <Chart title="Latency (ms)" history={history} field="latency" />
+        <Chart
+          title="Latency (ms)"
+          history={history}
+          field="latency"
+        />
+
         <Chart
           title="Packet Loss (%)"
           history={history}
           field="packet_loss"
           color="#f97316"
         />
+
         <Chart
           title="Simulated SNR (dB)"
           history={history}
           field="snr"
           color="#a78bfa"
         />
+
         <Chart
           title="Link Quality"
           history={history}
@@ -640,6 +946,10 @@ export default function App() {
     </>
   );
 
+  // -------------------------------
+  // Failure simulator panel
+  // -------------------------------
+
   const simulatorPanel = (
     <Card title="Link Failure Simulator">
       <p className="muted">
@@ -649,6 +959,7 @@ export default function App() {
 
       <label>
         Random seed
+
         <input
           type="number"
           min="0"
@@ -661,7 +972,8 @@ export default function App() {
 
       <div className="actions">
         <button onClick={startSimulation}>
-          <Play size={16} /> Start Simulation
+          <Play size={16} />
+          Start Simulation
         </button>
 
         <button
@@ -669,7 +981,8 @@ export default function App() {
           onClick={stopSimulation}
           disabled={!running}
         >
-          <Square size={16} /> Stop
+          <Square size={16} />
+          Stop
         </button>
       </div>
 
@@ -680,7 +993,11 @@ export default function App() {
           <button
             key={item}
             disabled={!running}
-            className={scenario === item ? "active" : "secondary"}
+            className={
+              scenario === item
+                ? "active"
+                : "secondary"
+            }
             onClick={() => changeScenario(item)}
           >
             {item.replaceAll("_", " ").toUpperCase()}
@@ -689,10 +1006,16 @@ export default function App() {
       </div>
 
       <p className="muted">
-        Running: {running ? "YES" : "NO"} | Scenario: {scenario}
+        Running: {running ? "YES" : "NO"}
+        {" | "}
+        Scenario: {scenario}
       </p>
     </Card>
   );
+
+  // -------------------------------
+  // Threshold panel
+  // -------------------------------
 
   const thresholdPanel = (
     <Card title="Acceptance Thresholds">
@@ -700,6 +1023,7 @@ export default function App() {
         {Object.keys(thresholds).map(key => (
           <label key={key}>
             {key}
+
             <input
               type="number"
               step="any"
@@ -715,18 +1039,28 @@ export default function App() {
         ))}
       </div>
 
-      <button onClick={saveThresholds}>Save Thresholds</button>
+      <button onClick={saveThresholds}>
+        Save Thresholds
+      </button>
     </Card>
   );
+
+  // -------------------------------
+  // ML analysis panel
+  // -------------------------------
 
   const mlPanel = (
     <Card title="Machine Learning Analysis">
       <p className="warning">
-        Models are initially trained on synthetic experimental data.
-        Classification is not proof of real-world jamming.
+        Models are initially trained on synthetic
+        experimental data. Classification is not
+        proof of real-world jamming.
       </p>
 
-      <button onClick={runML} disabled={!metrics}>
+      <button
+        onClick={runML}
+        disabled={!metrics}
+      >
         Run ML Prediction
       </button>
 
@@ -734,15 +1068,24 @@ export default function App() {
         <div className="details">
           <h4>Interference Classification</h4>
 
-          <Metric label="Prediction" value={prediction.label} />
+          <Metric
+            label="Prediction"
+            value={prediction.label}
+          />
 
           <Metric
             label="Model Confidence"
-            value={(prediction.confidence * 100).toFixed(2)}
+            value={
+              (
+                prediction.confidence * 100
+              ).toFixed(2)
+            }
             unit="%"
           />
 
-          <p className="muted">{prediction.warning}</p>
+          <p className="muted">
+            {prediction.warning}
+          </p>
         </div>
       )}
 
@@ -752,11 +1095,15 @@ export default function App() {
 
           <Metric
             label="Predicted Next Latency"
-            value={linkPrediction.predicted_next_latency_ms}
+            value={
+              linkPrediction.predicted_next_latency_ms
+            }
             unit="ms"
           />
 
-          <p className="muted">{linkPrediction.warning}</p>
+          <p className="muted">
+            {linkPrediction.warning}
+          </p>
         </div>
       )}
 
@@ -766,26 +1113,38 @@ export default function App() {
 
           <Metric
             label="Classifier F1"
-            value={evaluation.classification.f1.toFixed(3)}
+            value={
+              evaluation.classification.f1.toFixed(3)
+            }
           />
 
           <Metric
             label="Regression MAE"
-            value={evaluation.regression.model_mae.toFixed(3)}
+            value={
+              evaluation.regression.model_mae.toFixed(3)
+            }
           />
 
           <Metric
             label="Baseline MAE"
-            value={evaluation.regression.baseline_mae.toFixed(3)}
+            value={
+              evaluation.regression.baseline_mae.toFixed(3)
+            }
           />
         </div>
       )}
     </Card>
   );
 
+  // -------------------------------
+  // Experiment history
+  // -------------------------------
+
   const historyPanel = (
     <Card title="Experiment History">
-      <button onClick={loadEvents}>Refresh Events</button>
+      <button onClick={loadEvents}>
+        Refresh Events
+      </button>
 
       <div className="table-wrap">
         <table>
@@ -817,17 +1176,41 @@ export default function App() {
     </Card>
   );
 
+  // -------------------------------
+  // Navigation
+  // -------------------------------
+
   function renderPage() {
     switch (page) {
       case "Overview":
         return (
           <>
             <div className="metric-grid">
-              <Metric label="Tracked Satellites" value={satellites.length} />
-              <Metric label="Simulation" value={running ? "RUNNING" : "STOPPED"} />
-              <Metric label="Link State" value={metrics?.state} />
-              <Metric label="Link Quality" value={metrics?.quality} />
+              <Metric
+                label="Tracked Satellites"
+                value={satellites.length}
+              />
+
+              <Metric
+                label="Simulation"
+                value={
+                  running
+                    ? "RUNNING"
+                    : "STOPPED"
+                }
+              />
+
+              <Metric
+                label="Link State"
+                value={metrics?.state}
+              />
+
+              <Metric
+                label="Link Quality"
+                value={metrics?.quality}
+              />
             </div>
+
             {globePanel}
             {monitoringPanel}
           </>
@@ -882,20 +1265,21 @@ export default function App() {
         return (
           <Card title="About the Project">
             <p>
-              AI-Driven Satellite Network Monitoring and
-              Communication Link Failure Prediction.
+              AI-Driven Satellite Network Monitoring
+              and Communication Link Failure Prediction.
             </p>
 
             <p>
               Orbital data: CelesTrak.
               Orbital calculations: Skyfield.
-              Simulated measurements: Local Python simulator.
-              Machine learning: Scikit-learn.
+              Simulated measurements: Local Python
+              simulator. Machine learning: Scikit-learn.
             </p>
 
             <p className="warning">
-              This application does not directly communicate
-              with satellites or measure actual satellite RF signals.
+              This application does not directly
+              communicate with satellites or measure
+              actual satellite RF signals.
             </p>
           </Card>
         );
@@ -905,11 +1289,16 @@ export default function App() {
     }
   }
 
+  // -------------------------------
+  // Main dashboard layout
+  // -------------------------------
+
   return (
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
           <Satellite size={28} />
+
           <div>
             <strong>SATELLITE AI</strong>
             <small>NETWORK OPERATIONS</small>
@@ -920,7 +1309,11 @@ export default function App() {
           {MENU.map(([name, Icon]) => (
             <button
               key={name}
-              className={page === name ? "nav active" : "nav"}
+              className={
+                page === name
+                  ? "nav active"
+                  : "nav"
+              }
               onClick={() => setPage(name)}
             >
               <Icon size={18} />
@@ -938,18 +1331,28 @@ export default function App() {
         <header className="topbar">
           <div>
             <h1>{page}</h1>
-            <p>Satellite Monitoring and Link Failure Prediction</p>
+
+            <p>
+              Satellite Monitoring and Link
+              Failure Prediction
+            </p>
           </div>
 
           <span className="status">
-            ● {running ? "SIMULATION ACTIVE" : "SYSTEM READY"}
+            ●{" "}
+            {running
+              ? "SIMULATION ACTIVE"
+              : "SYSTEM READY"}
           </span>
         </header>
 
         {error && (
           <div className="error">
             {error}
-            <button onClick={() => setError("")}>Dismiss</button>
+
+            <button onClick={() => setError("")}>
+              Dismiss
+            </button>
           </div>
         )}
 
