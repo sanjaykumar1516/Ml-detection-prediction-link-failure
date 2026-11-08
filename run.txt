@@ -1,0 +1,12 @@
+go to backend :
+
+cd "C:\Ml-detection-prediction-link failure\backend"
+activate virtual environment
+.\.venv\Scripts\Activate.ps1
+
+start backend :
+python -m uvicorn app.main:app --reload
+
+run front end:
+ cd "C:\Ml-detection-prediction-link failure\frontend"
+ npm.cmd run dev

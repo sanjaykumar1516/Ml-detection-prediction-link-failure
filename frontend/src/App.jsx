@@ -1,11 +1,10 @@
-
 import React, {
   useState,
+  useRef,
   useEffect,
   useCallback,
   useMemo
 } from "react";
-
 import {
   Viewer,
   Entity as CesiumEntity,
@@ -13,15 +12,12 @@ import {
 } from "resium";
 
 import {
-  Cartesian2,
   Cartesian3,
   Color,
-  Ion,
   ImageryLayer,
-  Terrain,
-  VerticalOrigin
+  Ion,
+  IonImageryProvider
 } from "cesium";
-
 import Plot from "react-plotly.js";
 
 import {
@@ -41,6 +37,10 @@ import {
 // Cesium ion token from frontend/.env
 Ion.defaultAccessToken =
   import.meta.env.VITE_CESIUM_ION_TOKEN || "";
+  console.log(
+  "Cesium token loaded:",
+  Boolean(import.meta.env.VITE_CESIUM_ION_TOKEN)
+);
 
 const API = "/api";
 
@@ -246,56 +246,69 @@ scene.requestRender();
 // 3D Globe
 // -------------------------------
 
-function Globe({
-  satellites,
-  selected,
-  onSelect,
-  station
-}) {
-  const imagery = useMemo(
-    () => ImageryLayer.fromWorldImagery(),
-    []
-  );
 
-  const terrain = useMemo(
-    () =>
-      Terrain.fromWorldTerrain({
-        requestVertexNormals: true,
-        requestWaterMask: true
-      }),
-    []
-  );
+function Globe({ satellites, selected, onSelect, station }) {
+  const viewerRef = useRef(null);
+
+  // Working OpenStreetMap imagery layer
+  const imagery = useMemo(
+  () =>
+    ImageryLayer.fromProviderAsync(
+      IonImageryProvider.fromAssetId(2)
+    ),
+  []
+);
+
+  // Configure the Earth after Cesium Viewer is created
+  useEffect(() => {
+  const viewer = viewerRef.current?.cesiumElement;
+
+  if (!viewer) return;
+
+  const scene = viewer.scene;
+  const globe = scene.globe;
+
+  globe.show = true;
+  globe.enableLighting = true;
+  globe.showGroundAtmosphere = true;
+
+  scene.skyAtmosphere.show = true;
+  scene.sun.show = true;
+  scene.moon.show = true;
+
+  scene.requestRender();
+
+}, []);
 
   return (
     <div className="globe">
       <Viewer
-        full
-        baseLayer={imagery}
-        terrain={undefined}
-        baseLayerPicker={false}
-        animation={false}
-        timeline={false}
-        geocoder={false}
-        homeButton={true}
-        navigationHelpButton={false}
-        sceneModePicker={false}
-        shouldAnimate={true}
-        infoBox={true}
-        selectionIndicator={true}
-      >
-        <EarthSettings />
+    
 
-        {/* Satellite positions */}
-        {satellites.map(sat => {
-          const longitude = Number(sat.longitude);
+  ref={viewerRef}
+  full
+  baseLayer={imagery}
+  baseLayerPicker={false}
+  animation={false}
+  timeline={false}
+  geocoder={false}
+  homeButton={true}
+  navigationHelpButton={false}
+  sceneModePicker={false}
+  shouldAnimate={true}
+>
+
+
+
+        {/* Satellite markers */}
+        {satellites.map((sat) => {
           const latitude = Number(sat.latitude);
-          const altitude =
-            Number(sat.altitude_km) * 1000;
+          const longitude = Number(sat.longitude);
+          const altitude = Number(sat.altitude_km || 0) * 1000;
 
           if (
-            !Number.isFinite(longitude) ||
             !Number.isFinite(latitude) ||
-            !Number.isFinite(altitude)
+            !Number.isFinite(longitude)
           ) {
             return null;
           }
@@ -306,77 +319,66 @@ function Globe({
             <CesiumEntity
               key={sat.id}
               name={sat.name}
-              description={
-                `Satellite: ${sat.name}<br/>` +
-                `NORAD ID: ${sat.id}<br/>` +
-                `Altitude: ${sat.altitude_km} km`
-              }
               position={Cartesian3.fromDegrees(
                 longitude,
                 latitude,
                 altitude
               )}
               point={{
-                pixelSize: isSelected ? 13 : 7,
+                pixelSize: isSelected ? 13 : 8,
                 color: isSelected
                   ? Color.YELLOW
                   : Color.CYAN,
                 outlineColor: Color.BLACK,
-                outlineWidth: 2,
-                disableDepthTestDistance:
-                  Number.POSITIVE_INFINITY
+                outlineWidth: 2
               }}
-              label={
-                isSelected
-                  ? {
-                      text: sat.name,
-                      font: "14px sans-serif",
-                      fillColor: Color.WHITE,
-                      outlineColor: Color.BLACK,
-                      outlineWidth: 2,
-                      pixelOffset: new Cartesian2(0, -22),
-                      verticalOrigin: VerticalOrigin.BOTTOM
-                    }
-                  : undefined
-              }
+              label={{
+                text: isSelected ? sat.name : "",
+                font: "14px sans-serif",
+                fillColor: Color.WHITE,
+                outlineColor: Color.BLACK,
+                outlineWidth: 3,
+                showBackground: true,
+                backgroundColor: Color.BLACK.withAlpha(0.6)
+              }}
+              description={`Satellite: ${sat.name}`}
               onClick={() => onSelect(sat.id)}
             />
           );
         })}
 
-        {/* Ground station */}
-        <CesiumEntity
-          name="Ground Station"
-          description="Demonstration ground station"
-          position={Cartesian3.fromDegrees(
-            Number(station.longitude),
-            Number(station.latitude),
-            Number(station.altitude_m)
-          )}
-          point={{
-            pixelSize: 12,
-            color: Color.LIME,
-            outlineColor: Color.WHITE,
-            outlineWidth: 2,
-            disableDepthTestDistance:
-              Number.POSITIVE_INFINITY
-          }}
-          label={{
-            text: "Ground Station",
-            font: "14px sans-serif",
-            fillColor: Color.WHITE,
-            outlineColor: Color.BLACK,
-            outlineWidth: 2,
-            pixelOffset: new Cartesian2(0, -20),
-            verticalOrigin: VerticalOrigin.BOTTOM,
-            disableDepthTestDistance:
-              Number.POSITIVE_INFINITY
-          }}
-        />
+        {/* Ground station marker */}
+        {station && (
+          <CesiumEntity
+            name="Bengaluru Ground Station"
+            position={Cartesian3.fromDegrees(
+              Number(station.longitude),
+              Number(station.latitude),
+              Number(station.altitude_m || 0)
+            )}
+            point={{
+              pixelSize: 15,
+              color: Color.LIME,
+              outlineColor: Color.WHITE,
+              outlineWidth: 3
+            }}
+            label={{
+              text: "Ground Station",
+              font: "16px sans-serif",
+              fillColor: Color.WHITE,
+              outlineColor: Color.BLACK,
+              outlineWidth: 3,
+              pixelOffset: { x: 0, y: -25 }
+            }}
+          />
+        )}
+
       </Viewer>
     </div>
   );
 }
+
+
 
 // -------------------------------
 // Main application
