@@ -163,3 +163,40 @@ def cascade_research(seed:int=500):
 def benchmark_research(seed:int=500):
     from app.research import benchmark
     return benchmark(seed)
+
+class MessageRequest(BaseModel):
+    source:str
+    target:str
+    message:str=Field(min_length=1,max_length=4000)
+    traffic:str='Normal data'
+
+@app.get('/api/v1/messages')
+def message_history():
+    with db() as con:
+        rows=con.execute("SELECT details FROM events WHERE kind='message' ORDER BY id DESC LIMIT 100").fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+@app.post('/api/v1/messages')
+def transmit(req:MessageRequest):
+    import networkx as nx
+    import random
+    snap=tick()
+    ids={n['id'] for n in snap['nodes']}
+    if req.source not in ids or req.target not in ids or req.source==req.target or not req.message.strip():
+        raise HTTPException(422,'Select distinct valid endpoints and a message')
+    demand={'Emergency communication':2,'Satellite control commands':1,'Normal data':8}.get(req.traffic)
+    if demand is None: raise HTTPException(422,'Unknown traffic class')
+    graph=nx.Graph();graph.add_nodes_from(ids)
+    for l in snap['links']:
+        if l['state']=='failed' or l['bandwidth_mbps']<demand: continue
+        risk=max(0,(18-l['snr_db'])/18)+l['loss_pct']/100
+        graph.add_edge(l['source'],l['target'],latency=l['latency_ms'],risk=l['latency_ms']/50+2*risk,loss=l['loss_pct']/100)
+    results={}; draws={frozenset((a,b)):random.random() for a,b in graph.edges}
+    for name,weight in [('Reactive','latency'),('Risk-aware','risk')]:
+        try: path=nx.shortest_path(graph,req.source,req.target,weight=weight)
+        except nx.NetworkXNoPath: path=[]
+        edges=list(zip(path,path[1:])); delivered=bool(path) and all(draws[frozenset((a,b))]>=graph[a][b]['loss'] for a,b in edges)
+        results[name]={'path':path,'delivered':delivered,'latency_ms':round(sum(graph[a][b]['latency'] for a,b in edges),2) if path else None}
+    record={**req.model_dump(),'id':uuid.uuid4().hex,'time_s':snap['time_s'],'results':results}
+    log('message',record)
+    return record
