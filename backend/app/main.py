@@ -14,6 +14,9 @@ from app.ml import models, infer
 DB="data/events.sqlite3"
 faults=[]
 schedules=[]
+manual_queue=[]
+reservations={}
+PRIORITY={"Emergency communication":0,"Satellite control commands":1,"Normal data":2}
 mesh=True
 state={"running":True,"scenario":"healthy","speed":1.0,"sim_time":0.0,"last_wall":time.monotonic()}
 
@@ -132,6 +135,10 @@ async def clear_faults():
 async def reset():
     faults.clear()
     schedules.clear()
+    manual_queue.clear()
+    reservations.clear()
+    with db() as con:
+        con.execute("DELETE FROM events WHERE kind='message'")
     state.update(sim_time=0.0,scenario="healthy",running=True,speed=1.0,last_wall=time.monotonic())
     log("reset",{})
     return {"ok":True}
@@ -192,9 +199,20 @@ async def message_history():
 
 @app.post('/api/v1/messages')
 async def transmit(req:MessageRequest):
-    return deliver(req,tick())
+    snap=tick()
+    ids={n['id'] for n in snap['nodes']}
+    if req.source not in ids or req.target not in ids or req.source==req.target or not req.message.strip() or req.traffic not in ('Emergency communication','Satellite control commands','Normal data'):
+        raise HTTPException(422,'Invalid communication configuration')
+    if len(manual_queue)>=200: raise HTTPException(409,'Manual queue full')
+    job={**req.model_dump(),'id':uuid.uuid4().hex,'time_s':snap['time_s'],'status':'queued'}
+    manual_queue.append(job)
+    return job
 
-def deliver(req:MessageRequest,snap,schedule_id=None):
+@app.get('/api/v1/message-queue')
+async def queued_messages():
+    return manual_queue
+
+def deliver(req:MessageRequest,snap,schedule_id=None,message_id=None):
     import networkx as nx
     import random
     ids={n['id'] for n in snap['nodes']}
@@ -202,18 +220,36 @@ def deliver(req:MessageRequest,snap,schedule_id=None):
         raise HTTPException(422,'Select distinct valid endpoints and a message')
     demand={'Emergency communication':2,'Satellite control commands':1,'Normal data':8}.get(req.traffic)
     if demand is None: raise HTTPException(422,'Unknown traffic class')
-    graph=nx.Graph();graph.add_nodes_from(ids)
-    for l in snap['links']:
-        if l['state']=='failed' or l['bandwidth_mbps']<demand: continue
-        risk=max(0,(18-l['snr_db'])/18)+l['loss_pct']/100
-        graph.add_edge(l['source'],l['target'],latency=l['latency_ms'],risk=l['latency_ms']/50+2*risk,loss=l['loss_pct']/100)
-    results={}; draws={frozenset((a,b)):random.random() for a,b in graph.edges}
-    for name,weight in [('Reactive','latency'),('Risk-aware','risk')]:
+    slot=int(snap["time_s"])
+    used=reservations.setdefault(slot,{"Reactive":{},"Risk-aware":{}})
+    results={}; excluded={}
+    draws={frozenset((l["source"],l["target"])):random.random() for l in snap["links"]}
+    for name,weight in [("Reactive","latency"),("Risk-aware","risk")]:
+        graph=nx.Graph();graph.add_nodes_from(ids)
+        excluded[name]=[]
+        for l in snap['links']:
+            key=frozenset((l['source'],l['target']))
+            remaining=max(0,l['bandwidth_mbps']-used[name].get(key,0))
+            if l['state']=='failed' or remaining<demand:
+                excluded[name].append({'id':l['id'],'reason':'Failed' if l['state']=='failed' else 'Insufficient remaining bandwidth'})
+                continue
+            risk=max(0,(18-l['snr_db'])/18)+l['loss_pct']/100
+            graph.add_edge(l['source'],l['target'],latency=l['latency_ms'],risk=l['latency_ms']/50+2*risk,loss=l['loss_pct']/100,remaining=remaining)
         try: path=nx.shortest_path(graph,req.source,req.target,weight=weight)
         except nx.NetworkXNoPath: path=[]
         edges=list(zip(path,path[1:])); delivered=bool(path) and all(draws[frozenset((a,b))]>=graph[a][b]['loss'] for a,b in edges)
-        results[name]={'path':path,'delivered':delivered,'latency_ms':round(sum(graph[a][b]['latency'] for a,b in edges),2) if path else None}
-    record={**req.model_dump(),'id':uuid.uuid4().hex,'time_s':snap['time_s'],'results':results,'schedule_id':schedule_id}
+        def describe(candidate):
+            hops=[]
+            for a,b in zip(candidate,candidate[1:]):
+                link=next(l for l in snap['links'] if {l['source'],l['target']}=={a,b})
+                hops.append({'source':a,'target':b,'snr_db':link['snr_db'],'loss_pct':link['loss_pct'],'bandwidth_mbps':graph[a][b]['remaining'],'latency_ms':link['latency_ms'],'cost':graph[a][b][weight]})
+            return {'path':candidate,'cost':sum(h['cost'] for h in hops),'hops':hops}
+        from itertools import islice
+        candidates=list(islice(nx.shortest_simple_paths(graph,req.source,req.target,weight=weight),3)) if path else []
+        results[name]={'path':path,'delivered':delivered,'latency_ms':round(sum(graph[a][b]['latency'] for a,b in edges),2) if path else None,'selected':describe(path) if path else None,'candidates':[describe(c) for c in candidates],'weight':weight,'failed_hops':[[a,b] for a,b in edges if draws[frozenset((a,b))]<graph[a][b]['loss']]}
+        for a,b in edges:
+            key=frozenset((a,b)); used[name][key]=used[name].get(key,0)+demand
+    record={**req.model_dump(),'id':message_id or uuid.uuid4().hex,'time_s':snap['time_s'],'results':results,'schedule_id':schedule_id,'snapshot':snap,'excluded_links':excluded['Risk-aware'],'excluded_by_strategy':excluded,'demand_mbps':demand}
     log('message',record)
     return record
 
@@ -250,13 +286,18 @@ async def cancel_schedule(job_id:str):
     raise HTTPException(404,'Schedule not found')
 
 def process_schedules(snap):
-    # Claim each due slot before delivery. All tick callers run on the event loop.
-    for job in sorted(schedules,key=lambda j:({'Emergency communication':0,'Satellite control commands':1,'Normal data':2}[j['traffic']],j['next_s'])):
+    # Merge due transmissions across sessions, then prioritize within each simulated second.
+    due=[]
+    for job in schedules:
         while job['status'] in ('scheduled','active') and job['next_s']<=snap['time_s']:
-            due=job['next_s']
-            job['sent']+=1
-            job['next_s']+=job['interval_s']
+            when=job['next_s']; job['sent']+=1; job['next_s']+=job['interval_s']
             job['status']='completed' if job['sent']>=job['count'] else 'active'
-            # Evaluate at the scheduled simulation time, not the later polling time.
-            frame=snapshot(due,state['scenario'],faults=faults,mesh=mesh)
-            deliver(MessageRequest(**job),frame,job['id'])
+            due.append((when,job,job['id'],None))
+    for job in manual_queue:
+        due.append((snap['time_s'],job,None,job['id']))
+    manual_queue.clear()
+    for when,job,sid,mid in sorted(due,key=lambda x:(int(x[0]),PRIORITY[x[1]['traffic']],x[0])):
+        frame=snapshot(when,state['scenario'],faults=faults,mesh=mesh)
+        deliver(MessageRequest(**job),frame,sid,mid)
+    for slot in list(reservations):
+        if slot<int(snap['time_s']): del reservations[slot]
