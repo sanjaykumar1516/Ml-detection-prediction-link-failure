@@ -1,4 +1,6 @@
 import asyncio
+import random
+from collections import deque
 import json
 import uuid
 import os
@@ -18,6 +20,12 @@ manual_queue=[]
 reservations={}
 PRIORITY={"Emergency communication":0,"Satellite control commands":1,"Normal data":2}
 mesh=True
+traffic_config={"enabled":False,"interval_s":5,"count":3,"mode":"all","priority":"mixed","seed":42,"next_s":0,"generated":0}
+traffic_rng=random.Random(42)
+monitor_events=deque(maxlen=100)
+previous_links={}
+message_results=deque(maxlen=100)
+run_id=uuid.uuid4().hex
 state={"running":True,"scenario":"healthy","speed":1.0,"sim_time":0.0,"last_wall":time.monotonic()}
 
 def db():
@@ -39,6 +47,8 @@ def tick():
     snap={**snapshot(round(state["sim_time"],2),state["scenario"],faults=faults,mesh=mesh), "running":state["running"], "speed":state["speed"], "mesh":mesh}
     if state['running']:
         process_schedules(snap)
+    update_monitor(snap)
+    snap['monitor']={"run_id":run_id,"schedules":[dict(j) for j in schedules],"queued":[dict(j) for j in manual_queue],"faults":[{**f,"status":"scheduled" if snap['time_s']<f['start_s'] else "active" if snap['time_s']<f['end_s'] else "completed"} for f in faults],"events":list(monitor_events),"messages":list(message_results),"generator":dict(traffic_config)}
     return snap
 
 @asynccontextmanager
@@ -133,6 +143,11 @@ async def clear_faults():
 
 @app.post("/api/v1/reset")
 async def reset():
+    global run_id
+    run_id=uuid.uuid4().hex
+    monitor_events.clear(); previous_links.clear(); message_results.clear()
+    traffic_config.update(enabled=False,next_s=0,generated=0)
+    traffic_rng.seed(traffic_config['seed'])
     faults.clear()
     schedules.clear()
     manual_queue.clear()
@@ -251,6 +266,13 @@ def deliver(req:MessageRequest,snap,schedule_id=None,message_id=None):
             key=frozenset((a,b)); used[name][key]=used[name].get(key,0)+demand
     record={**req.model_dump(),'id':message_id or uuid.uuid4().hex,'time_s':snap['time_s'],'results':results,'schedule_id':schedule_id,'snapshot':snap,'excluded_links':excluded['Risk-aware'],'excluded_by_strategy':excluded,'demand_mbps':demand}
     log('message',record)
+    summary={k:v for k,v in record.items() if k not in ('snapshot','excluded_links','excluded_by_strategy','results')}
+    summary['results']={k:{**{a:b for a,b in v.items() if a not in ('candidates','selected')},'selected':{'cost':v['selected']['cost']} if v['selected'] else None} for k,v in results.items()}
+    message_results.append(summary)
+    outcome=results['Risk-aware']
+    if len(outcome['path'])>2:
+        notify(snap['time_s'],'info','Multi-hop route selected',' → '.join(outcome['path']))
+    notify(snap['time_s'],'success' if outcome['delivered'] else 'error','Message delivered' if outcome['delivered'] else 'Message failed',f"{req.source} → {req.target} · {' → '.join(outcome['path']) or 'No route'}")
     return record
 
 
@@ -287,7 +309,7 @@ async def cancel_schedule(job_id:str):
 
 def process_schedules(snap):
     # Merge due transmissions across sessions, then prioritize within each simulated second.
-    due=[]
+    due=generate_traffic(snap)
     for job in schedules:
         while job['status'] in ('scheduled','active') and job['next_s']<=snap['time_s']:
             when=job['next_s']; job['sent']+=1; job['next_s']+=job['interval_s']
@@ -301,3 +323,53 @@ def process_schedules(snap):
         deliver(MessageRequest(**job),frame,sid,mid)
     for slot in list(reservations):
         if slot<int(snap['time_s']): del reservations[slot]
+
+
+class TrafficConfig(BaseModel):
+    enabled:bool=False
+    interval_s:int=Field(5,ge=1,le=30)
+    count:int=Field(3,ge=1,le=10)
+    mode:str='all'
+    priority:str='mixed'
+    seed:int=Field(42,ge=0,le=2147483647)
+
+@app.get('/api/v1/traffic-generator')
+async def get_traffic():
+    return traffic_config
+
+@app.post('/api/v1/traffic-generator')
+async def configure_traffic(req:TrafficConfig):
+    if req.mode not in ('all','ss','sg','gs','gg') or req.priority not in ('mixed',*PRIORITY):
+        raise HTTPException(422,'Invalid traffic configuration')
+    tick()
+    traffic_rng.seed(req.seed)
+    traffic_config.update(req.model_dump(),next_s=state['sim_time']+req.interval_s,generated=0)
+    return traffic_config
+
+def generate_traffic(snap):
+    c=traffic_config
+    if not c['enabled']: return []
+    nodes=snap['nodes']; pairs=[(a['id'],b['id']) for a in nodes for b in nodes if a['id']!=b['id'] and (c['mode']=='all' or c['mode']==a['kind'][0]+b['kind'][0])]
+    if not pairs: return []
+    due=[]
+    while c['next_s']<=snap['time_s']:
+        when=c['next_s']; c['next_s']+=c['interval_s']
+        for _ in range(c['count']):
+            a,b=traffic_rng.choice(pairs)
+            priority=traffic_rng.choice(list(PRIORITY)) if c['priority']=='mixed' else c['priority']
+            text=traffic_rng.choice({'Emergency communication':['Emergency status request','Emergency relay request'],'Satellite control commands':['Request position confirmation','Synchronize network status'],'Normal data':['Orbital telemetry update','Weather observation data']}[priority])
+            c['generated']+=1
+            due.append((when,dict(source=a,target=b,message=text,traffic=priority),'AUTO',uuid.uuid4().hex))
+    return due
+
+def notify(t,level,title,detail):
+    monitor_events.append(dict(id=uuid.uuid4().hex,time_s=t,level=level,title=title,detail=detail))
+
+def update_monitor(snap):
+    if not snap['running']: return
+    current={l['id']:l['state'] for l in snap['links']}
+    for key,value in current.items():
+        old=previous_links.get(key)
+        if old is not None and old!=value:
+            notify(snap['time_s'],{'healthy':'success','degraded':'warning','failed':'error'}.get(value,'info'),{'healthy':'Link recovered','degraded':'Link degraded','failed':'Link failed'}.get(value,value),key)
+    previous_links.clear(); previous_links.update(current)

@@ -1,6 +1,9 @@
 services:
   backend:
     build: ./backend
+    networks:
+      leo_net:
+        aliases: [backend]
     ports:
       - "8000:8000"
     volumes:
@@ -9,6 +12,7 @@ services:
       - PYTHONUNBUFFERED=1
   frontend:
     build: ./frontend
+    networks: [leo_net]
     ports:
       - "5173:5173"
     depends_on:
@@ -21,3 +25,7 @@ services:
 volumes:
   satellite_data:
   frontend_node_modules:
+
+networks:
+  leo_net:
+    driver: bridge
